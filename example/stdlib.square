@@ -1,0 +1,5 @@
+extern int8_t* malloc(size_t s);
+extern void free(int8_t* p);
+extern int64_t write(int32_t fd, int8_t* buf, int64_t len);
+extern int64_t strlen(int8_t* s);
+extern int32_t printf(const char* fmt, ...);

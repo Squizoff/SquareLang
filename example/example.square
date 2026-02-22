@@ -1,0 +1,74 @@
+#include "stdlib.square"
+
+struct Person {
+    int32_t id;
+    int8_t* name;
+    size_t  name_len;
+};
+
+void print(const char s) {
+    write(1, s, strlen(s));
+}
+
+void print_const(const int8_t* s) {
+    write(1, (int8_t*) s, strlen((int8_t*) s));
+}
+
+void set_buffer_size(int8_t** pbuf, size_t new_size) {
+    (void)pbuf;
+    (void)new_size;
+}
+
+int32_t main() {
+    size_t n = 16;
+
+    char ch = 'A';
+
+    uint8_t u8 = 65;
+
+    unsigned int32_t cnt = 0;
+
+    local int8_t *buf;
+    local int8_t **pbufptr;
+
+    buf = malloc(n);
+
+    buf[0]  = 'H';
+    buf[1]  = 'e';
+    buf[2]  = 'l';
+    buf[3]  = 'l';
+    buf[4]  = 'o';
+    buf[5]  = ',';
+    buf[6]  = ' ';
+    buf[7]  = 'W';
+    buf[8]  = 'o';
+    buf[9]  = 'r';
+    buf[10] = 'l';
+    buf[11] = 'd';
+    buf[12] = '!';
+    buf[13] = '\n';
+    buf[14] = 0;
+
+    if ( (int32_t)ch == (int32_t)u8 ) {
+        cnt = cnt + 1;
+    }
+
+    print_const(buf);
+
+    pbufptr = NULL;
+    set_buffer_size(pbufptr, n);
+
+    free(buf);
+
+    char testinc = 'A';
+    printf("%c\n", testinc);
+
+    Person *chel;
+
+    chel = malloc(sizeof(struct Person));
+    chel->name = "work";
+
+    printf("%s\n", chel->name);
+
+    return 0;
+}
