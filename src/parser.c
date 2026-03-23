@@ -459,6 +459,24 @@ Expr* parse_primary( Parser* p )
 		ue->unary.operand = operand;
 		return ue;
 	}
+	if ( p->tok.kind == TK_OP && p->tok.str && strcmp( p->tok.str, "*" ) == 0 ) {
+		nexttok( p );
+		Expr* operand = parse_primary( p );
+		Expr* ue = calloc( 1, sizeof( Expr ) );
+		ue->kind = EX_UNARY;
+		ue->unary.op = '*';
+		ue->unary.operand = operand;
+		return ue;
+	}
+	if ( p->tok.kind == TK_OP && p->tok.str && strcmp( p->tok.str, "!" ) == 0 ) {
+		nexttok( p );
+		Expr* operand = parse_primary( p );
+		Expr* ue = calloc( 1, sizeof( Expr ) );
+		ue->kind = EX_UNARY;
+		ue->unary.op = '!';
+		ue->unary.operand = operand;
+		return ue;
+	}
 
 	if ( p->tok.kind == TK_IDENT && strcmp( p->tok.str, "sizeof" ) == 0 ) {
 		nexttok( p );
@@ -635,6 +653,37 @@ static Stmt** parse_block( Parser* p, int* out_cnt )
 	return arr;
 }
 
+static Stmt** parse_block_or_stmt( Parser* p, int* out_cnt )
+{
+	if ( accept_op( p, "{" ) ) {
+		Stmt** arr = NULL;
+		int	   cnt = 0;
+		if ( accept_op( p, "}" ) ) {
+			*out_cnt = 0;
+			return NULL;
+		}
+		do {
+			Stmt* s = parse_stmt( p );
+			if ( s ) {
+				arr = realloc( arr, sizeof( Stmt* ) * ( cnt + 1 ) );
+				arr[cnt++] = s;
+			}
+		} while ( !accept_op( p, "}" ) );
+		*out_cnt = cnt;
+		return arr;
+	}
+
+	Stmt* s = parse_stmt( p );
+	if ( s ) {
+		Stmt** arr = malloc( sizeof( Stmt* ) );
+		arr[0] = s;
+		*out_cnt = 1;
+		return arr;
+	}
+	*out_cnt = 0;
+	return NULL;
+}
+
 Stmt* parse_stmt( Parser* p )
 {
 	if ( p->tok.kind == TK_IDENT && strcmp( p->tok.str, "struct" ) == 0 ) {
@@ -673,12 +722,12 @@ Stmt* parse_stmt( Parser* p )
 		Expr* cond = parse_expr( p );
 		expect_op( p, ")" );
 		int	   then_cnt;
-		Stmt** then_stmts = parse_block( p, &then_cnt );
+		Stmt** then_stmts = parse_block_or_stmt( p, &then_cnt );
 		Stmt** else_stmts = NULL;
 		int	   else_cnt = 0;
 		if ( is_kw( p, TK_KW_ELSE ) ) {
 			nexttok( p );
-			else_stmts = parse_block( p, &else_cnt );
+			else_stmts = parse_block_or_stmt( p, &else_cnt );
 		}
 		s->kind = ST_IF;
 		s->ifs.cond = cond;
@@ -696,7 +745,7 @@ Stmt* parse_stmt( Parser* p )
 		Expr* cond = parse_expr( p );
 		expect_op( p, ")" );
 		int	   body_cnt;
-		Stmt** body = parse_block( p, &body_cnt );
+		Stmt** body = parse_block_or_stmt( p, &body_cnt );
 		s->kind = ST_WHILE;
 		s->wh.cond = cond;
 		s->wh.body = body;
@@ -704,15 +753,36 @@ Stmt* parse_stmt( Parser* p )
 		return s;
 	}
 
+	if ( p->tok.kind == TK_OP && p->tok.str && strcmp( p->tok.str, "*" ) == 0 ) {
+		Expr* lhs = parse_primary( p );
+		if ( accept_op( p, "=" ) ) {
+			Stmt* s = calloc( 1, sizeof( Stmt ) );
+			Expr* rhs = parse_expr( p );
+			s->kind = ST_ASSIGN;
+			s->assign.lvalue = lhs;
+			s->assign.expr = rhs;
+			expect_op( p, ";" );
+			return s;
+		} else {
+			Stmt* s = calloc( 1, sizeof( Stmt ) );
+			expect_op( p, ";" );
+			s->kind = ST_EXPR;
+			s->expr = lhs;
+			return s;
+		}
+	}
+
 	if ( p->tok.kind == TK_IDENT ) {
 		Expr* lhs = parse_primary( p );
 		if ( accept_op( p, "=" ) ) {
 			Stmt* s = calloc( 1, sizeof( Stmt ) );
 			Expr* rhs = parse_expr( p );
-			expect_op( p, ";" );
 			s->kind = ST_ASSIGN;
-			fill_assignment_target( p, lhs, s );
+			s->assign.lvalue = lhs;
+			if ( lhs->kind == EX_VAR || lhs->kind == EX_INDEX )
+				fill_assignment_target( p, lhs, s );
 			s->assign.expr = rhs;
+			expect_op( p, ";" );
 			return s;
 		} else {
 			Stmt* s = calloc( 1, sizeof( Stmt ) );
@@ -798,6 +868,8 @@ static void mangle_calls_in_stmt( Stmt* s, const char* from, const char* to )
 			break;
 		case ST_ASSIGN:
 			mangle_calls_in_expr( s->assign.expr, from, to );
+			if ( s->assign.lvalue )
+				mangle_calls_in_expr( s->assign.lvalue, from, to );
 			break;
 		case ST_RETURN:
 			mangle_calls_in_expr( s->ret, from, to );
@@ -1132,6 +1204,8 @@ static void check_calls_in_stmt( Stmt* s, const char* in_func )
 			break;
 		case ST_ASSIGN:
 			check_calls_in_expr( s->assign.expr, in_func );
+			if ( s->assign.lvalue )
+				check_calls_in_expr( s->assign.lvalue, in_func );
 			break;
 		case ST_RETURN:
 			check_calls_in_expr( s->ret, in_func );

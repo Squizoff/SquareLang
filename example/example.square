@@ -15,8 +15,17 @@ void print_const(const int8_t* s) {
 }
 
 void set_buffer_size(int8_t** pbuf, size_t new_size) {
-    (void)pbuf;
-    (void)new_size;
+    if (!pbuf) return;
+
+    if (*pbuf) {
+        int8_t *tmp = realloc(*pbuf, new_size);
+        if (!tmp) {
+            return;
+        }
+        *pbuf = tmp;
+    } else {
+        *pbuf = malloc(new_size);
+    }
 }
 
 int32_t main() {

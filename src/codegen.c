@@ -478,6 +478,19 @@ static Type get_expr_type( Expr* e )
 			return f->ret_type;
 	}
 
+	if ( e->kind == EX_UNARY ) {
+		if ( e->unary.op == '&' ) {
+			Type t = get_expr_type( e->unary.operand );
+			t.ptr_level++;
+			return t;
+		} else if ( e->unary.op == '*' ) {
+			Type t = get_expr_type( e->unary.operand );
+			if ( t.ptr_level > 0 )
+				t.ptr_level--;
+			return t;
+		}
+	}
+
 	return def;
 }
 
@@ -485,6 +498,16 @@ static char* gen_lvalue_address( Expr* e )
 {
 	if ( !e )
 		return strdup( "0" );
+	if ( e->kind == EX_UNARY && e->unary.op == '*' ) {
+		int	  k = 0;
+		char* v = gen_expr( e->unary.operand, &k );
+		char* ptr = v;
+		if ( k != 1 ) {
+			ptr = conv( v, k, 1 );
+			free( v );
+		}
+		return ptr;
+	}
 	if ( e->kind == EX_VAR ) {
 		const char* v = e->var;
 		char*		an = find_alloca( v );
@@ -972,6 +995,90 @@ static char* gen_expr( Expr* e, int* kind )
 				char* addr = gen_lvalue_address( operand );
 				*kind = 1;
 				return addr;
+			} else if ( op == '*' ) {
+				int	  pk = 0;
+				char* p = gen_expr( operand, &pk );
+				char* ptr = p;
+				if ( pk != 1 ) {
+					ptr = conv( p, pk, 1 );
+					free( p );
+				}
+
+				Type t = get_expr_type( operand );
+				if ( t.ptr_level > 0 )
+					t.ptr_level--;
+				else {
+					t.base = TY_I8;
+					t.ptr_level = 0;
+				}
+
+				char llvmty[64];
+				int	 stor = type_to_storage_and_llvm( t, llvmty, sizeof llvmty );
+				if ( stor == 4 ) {
+					/* struct value is not supported as a first-class expression; return address */
+					*kind = 1;
+					return ptr;
+				}
+
+				char ptrty[128];
+				snprintf( ptrty, sizeof ptrty, "%s*", llvmty );
+				char* addrcast = newtemp();
+				emit( "  %s = bitcast i8* %s to %s", addrcast, ptr, ptrty );
+
+				if ( stor == 1 ) {
+					char* out = newtemp();
+					emit( "  %s = load i64, i64* %s", out, addrcast );
+					free( addrcast );
+					free( ptr );
+					*kind = 2;
+					return out;
+				} else if ( stor == 2 ) {
+					char* out = newtemp();
+					emit( "  %s = load i8*, i8** %s", out, addrcast );
+					free( addrcast );
+					free( ptr );
+					*kind = 1;
+					return out;
+				} else if ( stor == 3 ) {
+					char* loadb = newtemp();
+					emit( "  %s = load i8, i8* %s", loadb, addrcast );
+					char* sext = newtemp();
+					emit( "  %s = sext i8 %s to i32", sext, loadb );
+					free( loadb );
+					free( addrcast );
+					free( ptr );
+					*kind = 0;
+					return sext;
+				} else {
+					char* out = newtemp();
+					emit( "  %s = load i32, i32* %s", out, addrcast );
+					free( addrcast );
+					free( ptr );
+					*kind = 0;
+					return out;
+				}
+			} else if ( op == '!' ) {
+				int	  k = 0;
+				char* v = gen_expr( operand, &k );
+				char* cmp = newtemp();
+				if ( k == 1 ) {
+					char* t = newtemp();
+					emit( "  %s = ptrtoint i8* %s to i64", t, v );
+					emit( "  %s = icmp eq i64 %s, 0", cmp, t );
+					free( t );
+				} else if ( k == 2 ) {
+					emit( "  %s = icmp eq i64 %s, 0", cmp, v );
+				} else if ( k == 3 ) {
+					emit( "  %s = icmp eq i8 %s, 0", cmp, v );
+				} else {
+					emit( "  %s = icmp eq i32 %s, 0", cmp, v );
+				}
+				char* out = newtemp();
+				emit( "  %s = zext i1 %s to i32", out, cmp );
+				free( v );
+				free( cmp );
+				*kind = 0;
+				return out;
 			} else {
 				fprintf( stderr, "codegen: unsupported unary operator '%c'\\n", op );
 				*kind = 0;
@@ -986,6 +1093,7 @@ static char* gen_expr( Expr* e, int* kind )
 
 /* statements & functions */
 static void gen_stmt( Stmt* s );
+static int  cur_ret_is_void = 0;
 static void gen_func( Func* f )
 {
 	free_locals();
@@ -1058,6 +1166,7 @@ static void gen_func( Func* f )
 	emit( "define %s @%s(%s) {", retbuf, f->name, argsig ? argsig : "" );
 	free( argsig );
 	emit( "entry:" );
+	cur_ret_is_void = ( f->has_types && f->ret_type.base == TY_VOID && f->ret_type.ptr_level == 0 );
 	for ( int i = 0; i < f->nargs; i++ ) {
 		char argname[64];
 		snprintf( argname, sizeof argname, "arg.%d", i );
@@ -1101,6 +1210,7 @@ static void gen_func( Func* f )
 		emit( "  ret i32 0" );
 	}
 	emit( "}" );
+	cur_ret_is_void = 0;
 }
 
 /* gen_stmt */
@@ -1123,6 +1233,65 @@ static void gen_stmt( Stmt* s )
 			}
 			break;
 		case ST_ASSIGN: {
+			if ( s->assign.lvalue && s->assign.lvalue->kind == EX_UNARY && s->assign.lvalue->unary.op == '*' ) {
+				int	  k = 0;
+				char* v = gen_expr( s->assign.expr, &k );
+				char* addr = gen_lvalue_address( s->assign.lvalue );
+
+				Type ltype = get_expr_type( s->assign.lvalue );
+				char llvmty[64];
+				int	 stor = type_to_storage_and_llvm( ltype, llvmty, sizeof llvmty );
+				if ( stor == 4 ) {
+					fprintf( stderr, "Assignment to struct via deref is not supported\n" );
+					exit( 1 );
+				}
+				int want_kind
+					= ( ltype.ptr_level > 0 ) ? 1 : ( ltype.base == TY_I64 ? 2 : ( ltype.base == TY_I8 || ltype.base == TY_CHAR ? 3 : 0 ) );
+
+				char ptrty[128];
+				snprintf( ptrty, sizeof ptrty, "%s*", llvmty );
+				char* addrcast = newtemp();
+				emit( "  %s = bitcast i8* %s to %s", addrcast, addr, ptrty );
+
+				if ( want_kind == 1 ) {
+					char* valtmp = v;
+					if ( k != 1 )
+						valtmp = conv( v, k, 1 );
+					emit( "  store i8* %s, i8** %s", valtmp, addrcast );
+					if ( valtmp != v )
+						free( valtmp );
+				} else if ( want_kind == 2 ) {
+					char* valtmp = v;
+					if ( k != 2 )
+						valtmp = conv( v, k, 2 );
+					emit( "  store i64 %s, i64* %s", valtmp, addrcast );
+					if ( valtmp != v )
+						free( valtmp );
+				} else if ( want_kind == 3 ) {
+					char* valtmp = v;
+					if ( k != 0 )
+						valtmp = conv( v, k, 0 );
+					char* trunc_tmp = newtemp();
+					emit( "  %s = trunc i32 %s to i8", trunc_tmp, valtmp );
+					emit( "  store i8 %s, i8* %s", trunc_tmp, addrcast );
+					if ( valtmp != v )
+						free( valtmp );
+					free( trunc_tmp );
+				} else {
+					char* valtmp = v;
+					if ( k != 0 )
+						valtmp = conv( v, k, 0 );
+					emit( "  store i32 %s, i32* %s", valtmp, addrcast );
+					if ( valtmp != v )
+						free( valtmp );
+				}
+
+				free( addr );
+				free( addrcast );
+				free( v );
+				break;
+			}
+
 			char* an = find_alloca( s->assign.var );
 			int	  stor = 0;
 			char  llvmty[64];
@@ -1268,6 +1437,15 @@ static void gen_stmt( Stmt* s )
 			break;
 		}
 		case ST_RETURN: {
+			if ( cur_ret_is_void ) {
+				if ( s->ret ) {
+					int	  k = 0;
+					char* v = gen_expr( s->ret, &k );
+					free( v );
+				}
+				emit( "  ret void" );
+				break;
+			}
 			if ( !s->ret ) {
 				emit( "  ret i32 0" );
 				break;

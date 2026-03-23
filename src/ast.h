@@ -113,6 +113,7 @@ struct Stmt
 			Expr* expr;
 			Expr* index;
 			Type  vartype;
+			Expr* lvalue;
 		} assign;
 		struct
 		{
