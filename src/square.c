@@ -29,7 +29,16 @@ int main( int argc, char** argv )
 
 	parse_program( &p );
 
+	if ( parser_error_count() > 0 ) {
+		free( buf );
+		return 1;
+	}
+
 	check_all_calls();
+	if ( parser_error_count() > 0 ) {
+		free( buf );
+		return 1;
+	}
 	codegen_all( argv[2] );
 	printf( "Compiled %s -> %s\n", argv[1], argv[2] );
 

@@ -6,6 +6,7 @@
 Func** parse_file_into_funcs_from_buffer( const char* buf, int* out_cnt );
 void parse_program( Parser* p );
 void check_all_calls( void );
+int  parser_error_count( void );
 
 void parser_init( Parser* p );
 

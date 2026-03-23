@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 
 Func** funcs = NULL;
@@ -12,6 +13,89 @@ int	   func_cnt = 0;
 
 StructDef** g_structs = NULL;
 int			g_struct_cnt = 0;
+
+static void nexttok( Parser* p );
+
+#define PARSER_ERROR_LIMIT 30
+
+static int g_error_count = 0;
+
+int parser_error_count( void )
+{
+	return g_error_count;
+}
+
+static void parser_error_v( const char* fmt, va_list ap )
+{
+	vfprintf( stderr, fmt, ap );
+	g_error_count++;
+	if ( g_error_count > PARSER_ERROR_LIMIT ) {
+		fprintf( stderr, "Too many errors, stopping.\n" );
+		exit( 1 );
+	}
+}
+
+static void parser_error( const char* fmt, ... )
+{
+	va_list ap;
+	va_start( ap, fmt );
+	parser_error_v( fmt, ap );
+	va_end( ap );
+}
+
+static int is_sync_op( const char* s )
+{
+	return strcmp( s, ";" ) == 0 || strcmp( s, "}" ) == 0 || strcmp( s, "{" ) == 0 || strcmp( s, ")" ) == 0 || strcmp( s, "]" ) == 0
+		|| strcmp( s, "," ) == 0;
+}
+
+static void sync_after_error( Parser* p )
+{
+	while ( p->tok.kind != TK_EOF ) {
+		if ( p->tok.kind == TK_OP && p->tok.str && is_sync_op( p->tok.str ) )
+			return;
+		nexttok( p );
+	}
+}
+
+static void skip_block( Parser* p )
+{
+	if ( !( p->tok.kind == TK_OP && p->tok.str && strcmp( p->tok.str, "{" ) == 0 ) )
+		return;
+
+	int depth = 0;
+	while ( p->tok.kind != TK_EOF ) {
+		if ( p->tok.kind == TK_OP && p->tok.str ) {
+			if ( strcmp( p->tok.str, "{" ) == 0 ) {
+				depth++;
+			} else if ( strcmp( p->tok.str, "}" ) == 0 ) {
+				depth--;
+				if ( depth == 0 ) {
+					nexttok( p );
+					return;
+				}
+			}
+		}
+		nexttok( p );
+	}
+}
+
+static void recover_to_toplevel( Parser* p )
+{
+	while ( p->tok.kind != TK_EOF ) {
+		if ( p->tok.kind == TK_OP && p->tok.str ) {
+			if ( strcmp( p->tok.str, "{" ) == 0 ) {
+				skip_block( p );
+				return;
+			}
+			if ( strcmp( p->tok.str, ";" ) == 0 || strcmp( p->tok.str, "}" ) == 0 ) {
+				nexttok( p );
+				return;
+			}
+		}
+		nexttok( p );
+	}
+}
 
 static StructDef* find_struct_by_name( const char* name )
 {
@@ -46,8 +130,9 @@ static int accept_op( Parser* p, const char* s )
 static void expect_op( Parser* p, const char* s )
 {
 	if ( !accept_op( p, s ) ) {
-		fprintf( stderr, "Parse error line %d: expected '%s', got '%s'\n", p->tok.line, s, p->tok.str ? p->tok.str : "<null>" );
-		exit( 1 );
+		parser_error( "Parse error line %d: expected '%s', got '%s'\n", p->tok.line, s, p->tok.str ? p->tok.str : "<null>" );
+		sync_after_error( p );
+		accept_op( p, s );
 	}
 }
 static int is_kw( Parser* p, TokenKind k )
@@ -61,8 +146,14 @@ static int is_ident( Parser* p )
 static char* consume_ident( Parser* p )
 {
 	if ( !is_ident( p ) ) {
-		fprintf( stderr, "Parse error line %d: expected ident\n", p->tok.line );
-		exit( 1 );
+		parser_error( "Parse error line %d: expected ident\n", p->tok.line );
+		sync_after_error( p );
+		if ( is_ident( p ) ) {
+			char* r = strdup( p->tok.str );
+			nexttok( p );
+			return r;
+		}
+		return strdup( "_" );
 	}
 	char* r = strdup( p->tok.str );
 	nexttok( p );
@@ -166,8 +257,10 @@ static Type parse_type( Parser* p )
 	if ( p->tok.kind == TK_IDENT && strcmp( p->tok.str, "struct" ) == 0 ) {
 		nexttok( p );
 		if ( p->tok.kind != TK_IDENT ) {
-			fprintf( stderr, "Parse error line %d: expected struct name\n", p->tok.line );
-			exit( 1 );
+			parser_error( "Parse error line %d: expected struct name\n", p->tok.line );
+			sync_after_error( p );
+			t.base = TY_I32;
+			return t;
 		}
 		char* sname = strdup( p->tok.str );
 		nexttok( p );
@@ -257,8 +350,10 @@ static Type parse_type( Parser* p )
 			t.base = TY_STRUCT;
 			t.struct_name = strdup( p->tok.str );
 		} else {
-			fprintf( stderr, "Unhandled type token '%s' at line %d\n", p->tok.str ? p->tok.str : "<null>", p->tok.line );
-			exit( 1 );
+			parser_error( "Unhandled type token '%s' at line %d\n", p->tok.str ? p->tok.str : "<null>", p->tok.line );
+			sync_after_error( p );
+			t.base = TY_I32;
+			return t;
 		}
 		nexttok( p );
 
@@ -270,8 +365,10 @@ static Type parse_type( Parser* p )
 		return t;
 	}
 
-	fprintf( stderr, "Parse error line %d: explicit type required (got '%s')\n", p->tok.line, p->tok.str ? p->tok.str : "<null>" );
-	exit( 1 );
+	parser_error( "Parse error line %d: explicit type required (got '%s')\n", p->tok.line, p->tok.str ? p->tok.str : "<null>" );
+	sync_after_error( p );
+	t.base = TY_I32;
+	return t;
 }
 
 static Type make_vararg_type( void )
@@ -319,8 +416,8 @@ static Stmt* parse_local_declaration_with_type( Parser* p, Type vart )
 {
 	Stmt* s = calloc( 1, sizeof( Stmt ) );
 	if ( p->tok.kind != TK_IDENT ) {
-		fprintf( stderr, "Parse error line %d: expected identifier after type\n", p->tok.line );
-		exit( 1 );
+		parser_error( "Parse error line %d: expected identifier after type\n", p->tok.line );
+		sync_after_error( p );
 	}
 	char* name = consume_ident( p );
 
@@ -361,8 +458,16 @@ static void parse_function_params( Parser* p, char*** out_args, Type** out_arg_t
 			}
 
 			if ( !( p->tok.kind == TK_IDENT && is_type_name( p->tok.str ) ) ) {
-				fprintf( stderr, "Parse error line %d: argument type required\n", p->tok.line );
-				exit( 1 );
+				parser_error( "Parse error line %d: argument type required\n", p->tok.line );
+				sync_after_error( p );
+				if ( accept_op( p, ")" ) )
+					break;
+				if ( accept_op( p, "," ) )
+					continue;
+				if ( p->tok.kind == TK_EOF )
+					break;
+				nexttok( p );
+				continue;
 			}
 			Type  at = parse_type( p );
 			char* aname = consume_ident( p );
@@ -392,8 +497,7 @@ static void ensure_unique_param_names( const char* fname, char** args, Type* arg
 			if ( arg_types && arg_types[j].base == TY_VARARG )
 				continue;
 			if ( strcmp( args[i], args[j] ) == 0 ) {
-				fprintf( stderr, "Parse error line %d: duplicate argument name '%s' in function '%s'\n", line, args[j], fname );
-				exit( 1 );
+				parser_error( "Parse error line %d: duplicate argument name '%s' in function '%s'\n", line, args[j], fname );
 			}
 		}
 	}
@@ -436,16 +540,19 @@ static void fill_assignment_target( Parser* p, Expr* lhs, Stmt* s )
 		while ( base->kind == EX_INDEX && base->index.target->kind == EX_INDEX )
 			base = base->index.target;
 		if ( base->kind != EX_INDEX || base->index.target->kind != EX_VAR ) {
-			fprintf( stderr, "Parse error line %d: invalid LHS in assignment\n", p->tok.line );
-			exit( 1 );
+			parser_error( "Parse error line %d: invalid LHS in assignment\n", p->tok.line );
+			s->assign.var = strdup( "_" );
+			s->assign.index = NULL;
+			return;
 		}
 		s->assign.var = base->index.target->var;
 		s->assign.index = outer_idx;
 		return;
 	}
 
-	fprintf( stderr, "Parse error line %d: invalid lvalue in assignment\n", p->tok.line );
-	exit( 1 );
+	parser_error( "Parse error line %d: invalid lvalue in assignment\n", p->tok.line );
+	s->assign.var = strdup( "_" );
+	s->assign.index = NULL;
 }
 
 Expr* parse_primary( Parser* p )
@@ -482,8 +589,10 @@ Expr* parse_primary( Parser* p )
 		nexttok( p );
 		expect_op( p, "(" );
 		if ( !( p->tok.kind == TK_IDENT && is_type_name( p->tok.str ) ) && !( p->tok.kind == TK_IDENT && strcmp( p->tok.str, "struct" ) == 0 ) ) {
-			fprintf( stderr, "Parse error line %d: sizeof expects a type\n", p->tok.line );
-			exit( 1 );
+			parser_error( "Parse error line %d: sizeof expects a type\n", p->tok.line );
+			sync_after_error( p );
+			accept_op( p, ")" );
+			return make_num_expr( 0 );
 		}
 		Type t = parse_type( p );
 		expect_op( p, ")" );
@@ -538,8 +647,10 @@ Expr* parse_primary( Parser* p )
 		while ( p->tok.kind == TK_OP && p->tok.str && ( strcmp( p->tok.str, "." ) == 0 || strcmp( p->tok.str, "->" ) == 0 ) ) {
 			nexttok( p );
 			if ( !is_ident( p ) ) {
-				fprintf( stderr, "Parse error line %d: expected identifier after member access operator\n", p->tok.line );
-				exit( 1 );
+				parser_error( "Parse error line %d: expected identifier after member access operator\n", p->tok.line );
+				sync_after_error( p );
+				if ( !is_ident( p ) )
+					break;
 			}
 			e = wrap_member_access( e, consume_ident( p ) );
 		}
@@ -573,8 +684,9 @@ Expr* parse_primary( Parser* p )
 		return e;
 	}
 
-	fprintf( stderr, "Parse primary error at line %d token '%s'\n", p->tok.line, p->tok.str ? p->tok.str : "<null>" );
-	exit( 1 );
+	parser_error( "Parse primary error at line %d token '%s'\n", p->tok.line, p->tok.str ? p->tok.str : "<null>" );
+	sync_after_error( p );
+	return make_num_expr( 0 );
 }
 
 /* binary precedence parser */
@@ -643,6 +755,10 @@ static Stmt** parse_block( Parser* p, int* out_cnt )
 		return NULL;
 	}
 	do {
+		if ( p->tok.kind == TK_EOF ) {
+			parser_error( "Parse error line %d: unexpected end of file (missing '}')\n", p->tok.line );
+			break;
+		}
 		Stmt* s = parse_stmt( p );
 		if ( s ) {
 			arr = realloc( arr, sizeof( Stmt* ) * ( cnt + 1 ) );
@@ -663,6 +779,10 @@ static Stmt** parse_block_or_stmt( Parser* p, int* out_cnt )
 			return NULL;
 		}
 		do {
+			if ( p->tok.kind == TK_EOF ) {
+				parser_error( "Parse error line %d: unexpected end of file (missing '}')\n", p->tok.line );
+				break;
+			}
 			Stmt* s = parse_stmt( p );
 			if ( s ) {
 				arr = realloc( arr, sizeof( Stmt* ) * ( cnt + 1 ) );
@@ -686,6 +806,23 @@ static Stmt** parse_block_or_stmt( Parser* p, int* out_cnt )
 
 Stmt* parse_stmt( Parser* p )
 {
+	if ( p->tok.kind == TK_EOF )
+		return NULL;
+	if ( p->tok.kind == TK_OP && p->tok.str ) {
+		if ( strcmp( p->tok.str, "}" ) == 0 )
+			return NULL;
+		if ( strcmp( p->tok.str, "{" ) == 0 ) {
+			parser_error( "Parse error line %d: unexpected '{'\n", p->tok.line );
+			skip_block( p );
+			return NULL;
+		}
+		if ( strcmp( p->tok.str, ")" ) == 0 || strcmp( p->tok.str, "]" ) == 0 || strcmp( p->tok.str, "," ) == 0 ) {
+			parser_error( "Parse error line %d: unexpected token '%s'\n", p->tok.line, p->tok.str );
+			nexttok( p );
+			return NULL;
+		}
+	}
+
 	if ( p->tok.kind == TK_IDENT && strcmp( p->tok.str, "struct" ) == 0 ) {
 		Type ignored = parse_type( p );
 		free_temp_type( &ignored );
@@ -966,8 +1103,9 @@ Func** parse_file_into_funcs_from_buffer( const char* buf, int* out_cnt )
 		if ( is_kw( &ip, TK_KW_EXTERN ) ) {
 			nexttok( &ip );
 			if ( !( ip.tok.kind == TK_IDENT && is_type_name( ip.tok.str ) ) ) {
-				fprintf( stderr, "Parse error line %d: function return type required\n", ip.tok.line );
-				exit( 1 );
+				parser_error( "Parse error line %d: function return type required\n", ip.tok.line );
+				recover_to_toplevel( &ip );
+				continue;
 			}
 			Type   ret = parse_type( &ip );
 			char*  fname = consume_ident( &ip );
@@ -984,8 +1122,9 @@ Func** parse_file_into_funcs_from_buffer( const char* buf, int* out_cnt )
 
 		if ( lookahead_is_function( &ip ) ) {
 			if ( !( ip.tok.kind == TK_IDENT && is_type_name( ip.tok.str ) ) ) {
-				fprintf( stderr, "Parse error line %d: function return type required\n", ip.tok.line );
-				exit( 1 );
+				parser_error( "Parse error line %d: function return type required\n", ip.tok.line );
+				recover_to_toplevel( &ip );
+				continue;
 			}
 			Type   ret = parse_type( &ip );
 			char*  fname = consume_ident( &ip );
@@ -1026,8 +1165,9 @@ void	   parse_program( Parser* p )
 		if ( is_kw( p, TK_KW_INCLUDE ) ) {
 			nexttok( p );
 			if ( p->tok.kind != TK_STRING ) {
-				fprintf( stderr, "Parse error line %d: include expects a string literal\n", p->tok.line );
-				exit( 1 );
+				parser_error( "Parse error line %d: include expects a string literal\n", p->tok.line );
+				recover_to_toplevel( p );
+				continue;
 			}
 			char* inc_fname = strdup( p->tok.str );
 			nexttok( p );
@@ -1090,12 +1230,18 @@ void	   parse_program( Parser* p )
 			Type  ret = parse_type( p );
 			char* fname = consume_ident( p );
 
+			int dup = 0;
 			for ( int i = 0; i < func_cnt; i++ ) {
 				if ( funcs[i] && funcs[i]->name && strcmp( funcs[i]->name, fname ) == 0 ) {
-					fprintf( stderr, "Parse error line %d: function '%s' already defined\n", p->tok.line, fname );
-					free( fname );
-					exit( 1 );
+					parser_error( "Parse error line %d: function '%s' already defined\n", p->tok.line, fname );
+					dup = 1;
+					break;
 				}
+			}
+			if ( dup ) {
+				free( fname );
+				recover_to_toplevel( p );
+				continue;
 			}
 
 			char** args = NULL;
@@ -1117,13 +1263,16 @@ void	   parse_program( Parser* p )
 		}
 
 		if ( p->tok.kind == TK_OP && p->tok.str && strcmp( p->tok.str, "}" ) == 0 ) {
-			fprintf( stderr, "Unmatched '}' at line %d\n", p->tok.line );
-			exit( 1 );
+			parser_error( "Unmatched '}' at line %d\n", p->tok.line );
+			nexttok( p );
+			continue;
 		}
 
 		Stmt* s = parse_stmt( p );
-		top_stmts = realloc( top_stmts, sizeof( Stmt* ) * ( top_cnt + 1 ) );
-		top_stmts[top_cnt++] = s;
+		if ( s ) {
+			top_stmts = realloc( top_stmts, sizeof( Stmt* ) * ( top_cnt + 1 ) );
+			top_stmts[top_cnt++] = s;
+		}
 		if ( p->tok.kind == TK_EOF && top_cnt > 0 ) {
 			int has_main = 0;
 			for ( int i = 0; i < func_cnt; i++ ) {
@@ -1134,8 +1283,7 @@ void	   parse_program( Parser* p )
 			}
 
 			if ( !has_main ) {
-				fprintf( stderr, "Parse error: top-level statements are not allowed without explicit main()\n" );
-				exit( 1 );
+				parser_error( "Parse error: top-level statements are not allowed without explicit main()\n" );
 			}
 		}
 	}
@@ -1169,18 +1317,18 @@ static void check_calls_in_expr( Expr* e, const char* in_func )
 				Func* local = find_local_definition( e->call.name );
 				if ( local ) {
 					if ( local->src_file )
-						fprintf( stderr,
+						parser_error(
 							"Undefined function '%s' called in function '%s': a local function '%s' is defined in included file '%s' and is not "
 							"visible outside that module.\n",
 							e->call.name, in_func ? in_func : "<unknown>", e->call.name, local->src_file );
 					else
-						fprintf( stderr,
+						parser_error(
 							"Undefined function '%s' called in function '%s': a local function '%s' is defined in another module and is not visible "
 							"here.\n",
 							e->call.name, in_func ? in_func : "<unknown>", e->call.name );
-				} else
-					fprintf( stderr, "Undefined function '%s' called in function '%s'\n", e->call.name, in_func ? in_func : "<unknown>" );
-				exit( 1 );
+				} else {
+					parser_error( "Undefined function '%s' called in function '%s'\n", e->call.name, in_func ? in_func : "<unknown>" );
+				}
 			}
 			for ( int i = 0; i < e->call.nargs; i++ )
 				check_calls_in_expr( e->call.args[i], in_func );
@@ -1239,6 +1387,7 @@ void check_all_calls( void )
 
 void parser_init( Parser* p )
 {
+	g_error_count = 0;
 	p->tok.str = NULL;
 	p->tok.kind = TK_EOF;
 	p->tok.num = 0;
