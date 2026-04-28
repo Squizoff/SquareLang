@@ -1,4 +1,5 @@
 #include "ast.h"
+#include "optimize.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +11,19 @@ extern int	  func_cnt;
 static FILE* outf = NULL;
 static int	 gen_id = 0;
 static int	 lbl_id = 0;
+
+typedef struct
+{
+	char*	name;
+	int64_t value;
+	int		kind;
+} GenConst;
+
+static GenConst* gen_consts = NULL;
+static int		 gen_const_n = 0;
+
+static int stmt_terminates( Stmt* s );
+static int expr_has_side_effects( const Expr* e );
 
 /* tiny utils */
 static char* newtemp( void )
@@ -192,6 +206,167 @@ static void free_locals( void )
 	free( locals );
 	locals = NULL;
 	loc_n = loc_cap = 0;
+}
+
+static void clear_gen_consts( void )
+{
+	for ( int i = 0; i < gen_const_n; i++ )
+		free( gen_consts[i].name );
+	free( gen_consts );
+	gen_consts = NULL;
+	gen_const_n = 0;
+}
+
+static void forget_gen_const( const char* name )
+{
+	if ( !name )
+		return;
+
+	for ( int i = 0; i < gen_const_n; ) {
+		if ( strcmp( gen_consts[i].name, name ) == 0 ) {
+			free( gen_consts[i].name );
+			memmove( &gen_consts[i], &gen_consts[i + 1], sizeof( *gen_consts ) * (size_t) ( gen_const_n - i - 1 ) );
+			gen_const_n--;
+			continue;
+		}
+		i++;
+	}
+}
+
+static void set_gen_const( const char* name, int64_t value, int kind )
+{
+	if ( !name )
+		return;
+
+	forget_gen_const( name );
+	gen_consts = realloc( gen_consts, sizeof( *gen_consts ) * (size_t) ( gen_const_n + 1 ) );
+	if ( !gen_consts ) {
+		perror( "realloc" );
+		exit( 1 );
+	}
+	gen_consts[gen_const_n].name = strdup( name );
+	gen_consts[gen_const_n].value = value;
+	gen_consts[gen_const_n].kind = kind;
+	gen_const_n++;
+}
+
+static int get_gen_const( const char* name, int64_t* value, int* kind )
+{
+	if ( !name )
+		return 0;
+
+	for ( int i = gen_const_n - 1; i >= 0; i-- ) {
+		if ( strcmp( gen_consts[i].name, name ) == 0 ) {
+			if ( value )
+				*value = gen_consts[i].value;
+			if ( kind )
+				*kind = gen_consts[i].kind;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int64_t fold_const_binary( char op, int64_t lhs, int64_t rhs, int* ok )
+{
+	*ok = 1;
+	switch ( op ) {
+		case '+':
+			return lhs + rhs;
+		case '-':
+			return lhs - rhs;
+		case '*':
+			return lhs * rhs;
+		case '/':
+			if ( rhs == 0 ) {
+				*ok = 0;
+				return 0;
+			}
+			return lhs / rhs;
+		case '%':
+			if ( rhs == 0 ) {
+				*ok = 0;
+				return 0;
+			}
+			return lhs % rhs;
+		case '=':
+			return lhs == rhs ? 1 : 0;
+		case '<':
+			return lhs < rhs ? 1 : 0;
+		case '>':
+			return lhs > rhs ? 1 : 0;
+		case '&':
+			return ( lhs != 0 && rhs != 0 ) ? 1 : 0;
+		case '|':
+			return ( lhs != 0 || rhs != 0 ) ? 1 : 0;
+		default:
+			*ok = 0;
+			return 0;
+	}
+}
+
+static int eval_const_expr( Expr* e, int64_t* value, int* kind )
+{
+	int64_t lhs = 0;
+	int64_t rhs = 0;
+	int		lk = 0;
+	int		rk = 0;
+
+	if ( !optimize_enabled() || !e )
+		return 0;
+
+	switch ( e->kind ) {
+		case EX_NUM:
+			if ( value )
+				*value = e->num;
+			if ( kind )
+				*kind = 0;
+			return 1;
+		case EX_VAR:
+			return get_gen_const( e->var, value, kind );
+		case EX_UNARY:
+			if ( e->unary.op == '!' && eval_const_expr( e->unary.operand, &lhs, &lk ) ) {
+				if ( value )
+					*value = lhs == 0 ? 1 : 0;
+				if ( kind )
+					*kind = 0;
+				return 1;
+			}
+			return 0;
+		case EX_BINOP:
+			if ( !eval_const_expr( e->bin.a, &lhs, &lk ) || !eval_const_expr( e->bin.b, &rhs, &rk ) )
+				return 0;
+			if ( value ) {
+				int ok = 0;
+				*value = fold_const_binary( e->bin.op, lhs, rhs, &ok );
+				if ( !ok )
+					return 0;
+			}
+			if ( kind )
+				*kind = 0;
+			return 1;
+		default:
+			return 0;
+	}
+}
+
+static int expr_has_side_effects( const Expr* e )
+{
+	if ( !e )
+		return 0;
+
+	switch ( e->kind ) {
+		case EX_CALL:
+			return 1;
+		case EX_BINOP:
+			return expr_has_side_effects( e->bin.a ) || expr_has_side_effects( e->bin.b );
+		case EX_UNARY:
+			return expr_has_side_effects( e->unary.operand );
+		case EX_INDEX:
+			return expr_has_side_effects( e->index.target ) || expr_has_side_effects( e->index.idx );
+		default:
+			return 0;
+	}
 }
 
 /* store full Type for locals so codegen can know struct names/ptr levels etc */
@@ -739,7 +914,7 @@ static char* gen_call( Expr* callexpr, int* is_ptr )
 			/* append varargs marker */
 			if ( paramsig && paramsig[0] != '\0' )
 				; /* keep comma separation when we use in emit */
-				  /* we'll later use "(<params>, ...)" */
+			/* we'll later use "(<params>, ...)" */
 		}
 
 		/* determine return handling */
@@ -883,6 +1058,16 @@ static char* gen_expr( Expr* e, int* kind )
 			return tmp;
 		}
 		case EX_VAR: {
+			int64_t cval = 0;
+			int		ckind = 0;
+			if ( eval_const_expr( e, &cval, &ckind ) ) {
+				char buf[64];
+				if ( ckind == 1 )
+					return strdup( cval == 0 ? "null" : "null" );
+				snprintf( buf, sizeof buf, "%lld", (long long) cval );
+				*kind = ckind;
+				return strdup( buf );
+			}
 			char* a = find_alloca( e->var );
 			if ( !a ) {
 				*kind = 0;
@@ -1093,10 +1278,11 @@ static char* gen_expr( Expr* e, int* kind )
 
 /* statements & functions */
 static void gen_stmt( Stmt* s );
-static int  cur_ret_is_void = 0;
+static int	cur_ret_is_void = 0;
 static void gen_func( Func* f )
 {
 	free_locals();
+	clear_gen_consts();
 	if ( loc_types ) {
 		for ( int i = 0; i < loc_types_n; i++ )
 			free( loc_types[i].name );
@@ -1204,13 +1390,22 @@ static void gen_func( Func* f )
 	for ( int i = 0; i < f->body_cnt; i++ )
 		gen_stmt( f->body[i] );
 
-	if ( f->has_types && f->ret_type.base == TY_VOID && f->ret_type.ptr_level == 0 ) {
-		emit( "  ret void" );
-	} else {
-		emit( "  ret i32 0" );
+	if ( f->body_cnt == 0 || !stmt_terminates( f->body[f->body_cnt - 1] ) ) {
+		if ( f->has_types && f->ret_type.base == TY_VOID && f->ret_type.ptr_level == 0 ) {
+			emit( "  ret void" );
+		} else {
+			emit( "  ret i32 0" );
+		}
 	}
 	emit( "}" );
 	cur_ret_is_void = 0;
+}
+
+static int stmt_terminates( Stmt* s )
+{
+	if ( !s )
+		return 0;
+	return s->kind == ST_RETURN;
 }
 
 /* gen_stmt */
@@ -1231,8 +1426,14 @@ static void gen_stmt( Stmt* s )
 				char* v = gen_expr( s->expr, &d );
 				free( v );
 			}
+			if ( optimize_enabled() && expr_has_side_effects( s->expr ) )
+				clear_gen_consts();
 			break;
 		case ST_ASSIGN: {
+			int64_t const_value = 0;
+			int		const_kind = 0;
+			int		has_const = eval_const_expr( s->assign.expr, &const_value, &const_kind );
+
 			if ( s->assign.lvalue && s->assign.lvalue->kind == EX_UNARY && s->assign.lvalue->unary.op == '*' ) {
 				int	  k = 0;
 				char* v = gen_expr( s->assign.expr, &k );
@@ -1245,8 +1446,7 @@ static void gen_stmt( Stmt* s )
 					fprintf( stderr, "Assignment to struct via deref is not supported\n" );
 					exit( 1 );
 				}
-				int want_kind
-					= ( ltype.ptr_level > 0 ) ? 1 : ( ltype.base == TY_I64 ? 2 : ( ltype.base == TY_I8 || ltype.base == TY_CHAR ? 3 : 0 ) );
+				int want_kind = ( ltype.ptr_level > 0 ) ? 1 : ( ltype.base == TY_I64 ? 2 : ( ltype.base == TY_I8 || ltype.base == TY_CHAR ? 3 : 0 ) );
 
 				char ptrty[128];
 				snprintf( ptrty, sizeof ptrty, "%s*", llvmty );
@@ -1289,6 +1489,8 @@ static void gen_stmt( Stmt* s )
 				free( addr );
 				free( addrcast );
 				free( v );
+				if ( optimize_enabled() )
+					clear_gen_consts();
 				break;
 			}
 
@@ -1404,6 +1606,8 @@ static void gen_stmt( Stmt* s )
 					free( base_ptr );
 					free( trunc_tmp );
 					free( v );
+					if ( optimize_enabled() )
+						clear_gen_consts();
 				}
 			} else {
 				char* tmp = v;
@@ -1434,6 +1638,14 @@ static void gen_stmt( Stmt* s )
 					free( tmp );
 				free( v );
 			}
+			if ( optimize_enabled() ) {
+				if ( s->assign.var && !s->assign.index && ( !s->assign.lvalue || s->assign.lvalue->kind == EX_VAR ) && has_const )
+					set_gen_const( s->assign.var, const_value, stor == 2 ? 1 : ( stor == 1 ? 2 : 0 ) );
+				else if ( s->assign.var && !s->assign.index && ( !s->assign.lvalue || s->assign.lvalue->kind == EX_VAR ) )
+					forget_gen_const( s->assign.var );
+				else
+					clear_gen_consts();
+			}
 			break;
 		}
 		case ST_RETURN: {
@@ -1462,6 +1674,15 @@ static void gen_stmt( Stmt* s )
 			break;
 		}
 		case ST_IF: {
+			int64_t const_cond = 0;
+			int		const_kind = 0;
+			if ( optimize_enabled() && eval_const_expr( s->ifs.cond, &const_cond, &const_kind ) ) {
+				Stmt** branch = const_cond ? s->ifs.then_stmts : s->ifs.else_stmts;
+				int	   branch_cnt = const_cond ? s->ifs.then_cnt : s->ifs.else_cnt;
+				for ( int i = 0; i < branch_cnt; i++ )
+					gen_stmt( branch[i] );
+				break;
+			}
 			char *L = newlbl( "if_then" ), *E = newlbl( "if_else" ), *X = newlbl( "if_end" );
 			int	  k = 0;
 			char* c = gen_expr( s->ifs.cond, &k );
@@ -1479,20 +1700,28 @@ static void gen_stmt( Stmt* s )
 			emit( "%s:", L );
 			for ( int i = 0; i < s->ifs.then_cnt; i++ )
 				gen_stmt( s->ifs.then_stmts[i] );
-			emit( "  br label %%%s", X );
+			if ( s->ifs.then_cnt == 0 || !stmt_terminates( s->ifs.then_stmts[s->ifs.then_cnt - 1] ) )
+				emit( "  br label %%%s", X );
 			emit( "%s:", E );
 			for ( int i = 0; i < s->ifs.else_cnt; i++ )
 				gen_stmt( s->ifs.else_stmts[i] );
-			emit( "  br label %%%s", X );
+			if ( s->ifs.else_cnt == 0 || !stmt_terminates( s->ifs.else_stmts[s->ifs.else_cnt - 1] ) )
+				emit( "  br label %%%s", X );
 			emit( "%s:", X );
 			free( L );
 			free( E );
 			free( X );
 			free( c );
 			free( cmp );
+			if ( optimize_enabled() )
+				clear_gen_consts();
 			break;
 		}
 		case ST_WHILE: {
+			int64_t const_cond = 0;
+			int		const_kind = 0;
+			if ( optimize_enabled() && eval_const_expr( s->wh.cond, &const_cond, &const_kind ) && const_cond == 0 )
+				break;
 			char *T = newlbl( "while_top" ), *B = newlbl( "while_body" ), *E = newlbl( "while_end" );
 			emit( "  br label %%%s", T );
 			emit( "%s:", T );
@@ -1512,16 +1741,21 @@ static void gen_stmt( Stmt* s )
 			emit( "%s:", B );
 			for ( int i = 0; i < s->wh.body_cnt; i++ )
 				gen_stmt( s->wh.body[i] );
-			emit( "  br label %%%s", T );
+			if ( s->wh.body_cnt == 0 || !stmt_terminates( s->wh.body[s->wh.body_cnt - 1] ) )
+				emit( "  br label %%%s", T );
 			emit( "%s:", E );
 			free( T );
 			free( B );
 			free( E );
 			free( c );
 			free( cmp );
+			if ( optimize_enabled() )
+				clear_gen_consts();
 			break;
 		}
 		case ST_ASM:
+			if ( optimize_enabled() )
+				clear_gen_consts();
 			if ( s->asm_code && s->asm_code[0] )
 				emit( "  ; inline asm: %s", s->asm_code );
 			break;
@@ -1552,6 +1786,7 @@ void codegen_all( const char* out_filename )
 		emit( "@%s = private constant [%d x i8] c\"%s\\00\"", sct[i].lbl, sct[i].len, sct[i].val );
 	fclose( outf );
 	free_locals();
+	clear_gen_consts();
 	if ( sct ) {
 		for ( int i = 0; i < sct_n; i++ ) {
 			free( sct[i].lbl );
